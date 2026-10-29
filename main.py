@@ -1,6 +1,7 @@
 import sys
 import os
 import pandas as pd
+import openpyxl
 import locale
 import json
 import re
@@ -8,8 +9,8 @@ from datetime import datetime
 from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, 
                                QHBoxLayout, QPushButton, QStackedWidget, QLabel, 
                                QFrame, QLineEdit, QFileDialog, QTableWidget, QHeaderView,
-                               QTableWidgetItem, QMessageBox, QTextEdit, QComboBox)
-from PySide6.QtGui import QIcon, QPixmap
+                               QTableWidgetItem, QMessageBox, QTextEdit, QComboBox, QListWidget, QListWidgetItem)
+from PySide6.QtGui import QIcon, QPixmap, QColor
 from PySide6.QtCore import Qt
 
 DIR_GLOBAL = "GLOBAL"
@@ -17,11 +18,11 @@ DIR_IMPORT = "IMPORT"
 DIR_EXPORT = "EXPORT"
 ARQUIVO_HISTORICO = os.path.join(DIR_GLOBAL, "historico_pendencias.csv")
 ARQUIVO_RESUMO = os.path.join(DIR_GLOBAL, "dados_app.json")
+CODIGO_DENSITOMETRIA = "0204060028"
 
 for d in [DIR_GLOBAL, DIR_IMPORT, DIR_EXPORT]:
     os.makedirs(d, exist_ok=True)
 
-# Helper function to reliably get resource path for PyInstaller
 def resource_path(relative_path):
     try:
         base_path = sys._MEIPASS
@@ -35,7 +36,6 @@ class CodureApp(QMainWindow):
         self.setWindowTitle("CODURE - Controle de Duplicidade de Registros")
         self.showMaximized()
         
-        # Seta o ícone na janela principal
         icone_path = resource_path("icone.png")
         if os.path.exists(icone_path):
             self.setWindowIcon(QIcon(icone_path))
@@ -55,8 +55,15 @@ class CodureApp(QMainWindow):
         
         self.dados_bpa_limpo = []
         self.dados_excluidos = []
-        self.dados_conferencia = []
+        self.dados_conferencia_rx = []
+        self.dados_conferencia_denso = []
         self.cabecalho_bpa = []
+        
+        self.buffer_pacientes = {}
+        self.conflitos_pendentes = {}
+        self.status_conflitos = {}
+        self.linhas_processadas = []
+        self.registros_quarentena = []
         
         self.configurar_estilos()
         
@@ -67,13 +74,12 @@ class CodureApp(QMainWindow):
         self.setCentralWidget(widget_central)
 
         sidebar = QFrame()
-        sidebar.setFixedWidth(250)
+        sidebar.setFixedWidth(280)
         sidebar.setStyleSheet("background-color: #1A1A1A; border-right: 1px solid #333333;")
         layout_sidebar = QVBoxLayout(sidebar)
         layout_sidebar.setContentsMargins(0, 20, 0, 0)
         layout_sidebar.setSpacing(10)
 
-        # Container para o título e ícone na sidebar
         h_titulo = QHBoxLayout()
         h_titulo.setContentsMargins(15, 0, 15, 0)
         
@@ -93,10 +99,11 @@ class CodureApp(QMainWindow):
 
         self.btn_etapa1 = QPushButton("1. Configuração Global")
         self.btn_etapa2 = QPushButton("2. Triagem do Mês")
-        self.btn_etapa3 = QPushButton("3. Gestão e Repescagem")
-        self.btn_etapa4 = QPushButton("4. Resumo Consolidado")
+        self.btn_etapa3 = QPushButton("3. Resolução de Conflitos")
+        self.btn_etapa4 = QPushButton("4. Gestão e Repescagem")
+        self.btn_etapa5 = QPushButton("5. Resumo Consolidado")
         
-        for btn in [self.btn_etapa1, self.btn_etapa2, self.btn_etapa3, self.btn_etapa4]:
+        for btn in [self.btn_etapa1, self.btn_etapa2, self.btn_etapa3, self.btn_etapa4, self.btn_etapa5]:
             btn.setObjectName("btn_sidebar")
             layout_sidebar.addWidget(btn)
         
@@ -105,6 +112,7 @@ class CodureApp(QMainWindow):
         self.paginas = QStackedWidget()
         self.paginas.addWidget(self.criar_pagina_configuracao())
         self.paginas.addWidget(self.criar_pagina_processamento())
+        self.paginas.addWidget(self.criar_pagina_resolucao())
         self.paginas.addWidget(self.criar_pagina_gestao())
         self.paginas.addWidget(self.criar_pagina_resumo())
 
@@ -112,6 +120,7 @@ class CodureApp(QMainWindow):
         self.btn_etapa2.clicked.connect(lambda: self.paginas.setCurrentIndex(1))
         self.btn_etapa3.clicked.connect(lambda: self.paginas.setCurrentIndex(2))
         self.btn_etapa4.clicked.connect(lambda: self.paginas.setCurrentIndex(3))
+        self.btn_etapa5.clicked.connect(lambda: self.paginas.setCurrentIndex(4))
 
         layout_principal.addWidget(sidebar)
         layout_principal.addWidget(self.paginas)
@@ -138,7 +147,7 @@ class CodureApp(QMainWindow):
             QLineEdit, QComboBox { background-color: #1E1E1E; color: #FFFFFF; border: 1px solid #444444; padding: 8px; border-radius: 4px; font-size: 14px; }
             QComboBox::drop-down { border: none; }
             QComboBox QAbstractItemView { background-color: #1E1E1E; color: #FFFFFF; selection-background-color: #4CAF50; }
-            QTableWidget { background-color: #1E1E1E; color: #E0E0E0; gridline-color: #333333; border: 1px solid #333333; }
+            QTableWidget, QListWidget { background-color: #1E1E1E; color: #E0E0E0; gridline-color: #333333; border: 1px solid #333333; }
             QHeaderView::section { background-color: #2C2C2C; color: #FFFFFF; padding: 4px; border: 1px solid #333333; }
             QTextEdit { background-color: #1E1E1E; color: #00FF00; font-family: Consolas, monospace; border: 1px solid #333333; padding: 10px; }
         """)
@@ -224,37 +233,41 @@ class CodureApp(QMainWindow):
     def atualizar_painel_resumo(self, comp_selecionada=None):
         comp = self.combo_comp.currentText()
         if not comp or comp not in self.dados_app.get('historicos', {}):
-            self.lbl_apresentado.setText("Total Apresentado (Prestador): 0 proc. | R$ 0,00")
-            self.lbl_retido.setText("Possíveis OCI (Retidos): 0 proc. | R$ 0,00")
-            self.lbl_baixado.setText("OCIs Concluídas (Baixados): 0 proc. | R$ 0,00")
-            self.lbl_liberado.setText("Total Liberado (BPA Limpo): 0 proc. | R$ 0,00")
+            for lbl in [self.lbl_apresentado, self.lbl_retido, self.lbl_baixado, self.lbl_liberado]:
+                lbl.setText("Nenhum dado encontrado.")
             return
             
         dados = self.dados_app['historicos'][comp]
         
-        def mk_texto(prefix, cat):
-            qtd = dados[cat]['Qtd']
-            valor = self.formatar_moeda(dados[cat]['Valor'])
-            return f"{prefix} {qtd} proc. | R$ {valor}"
+        def mk_texto(cat, titulo, show_denso):
+            t = dados[cat]['Total']
+            r = dados[cat]['RX']
+            d = dados[cat]['DENSO']
             
-        self.lbl_apresentado.setText(mk_texto("Total Apresentado (Prestador):", "Apresentado"))
-        self.lbl_retido.setText(mk_texto("Possíveis OCI (Retidos):", "Retido"))
-        self.lbl_baixado.setText(mk_texto("OCIs Concluídas (Baixados):", "Baixado"))
-        self.lbl_liberado.setText(mk_texto("Total Liberado (BPA Limpo):", "Liberado"))
+            base = f"{titulo}\nTOTAL: {t['Qtd']} proc. | R$ {self.formatar_moeda(t['Valor'])}\n"
+            if show_denso:
+                base += f" ├─ RX: {r['Qtd']} un. | R$ {self.formatar_moeda(r['Valor'])}\n"
+                base += f" └─ DENSO: {d['Qtd']} un. | R$ {self.formatar_moeda(d['Valor'])}"
+            else:
+                base += f" └─ RX: {r['Qtd']} un. | R$ {self.formatar_moeda(r['Valor'])}"
+            return base
+            
+        self.lbl_apresentado.setText(mk_texto("Apresentado", "Apresentado (Prestador)", True))
+        self.lbl_retido.setText(mk_texto("Retido", "Possíveis OCI (Retidos)", False))
+        self.lbl_baixado.setText(mk_texto("Baixado", "OCIs Concluídas (Baixados)", False))
+        self.lbl_liberado.setText(mk_texto("Liberado", "Total Liberado (BPA Limpo)", True))
 
     def avancar_competencia(self):
         comp = self.input_competencia.text().strip()
         if not comp or len(comp) != 6 or not comp.isdigit():
             QMessageBox.warning(self, "Aviso", "A competência na Etapa 1 está inválida.")
             return
-        
         ano = int(comp[:4])
         mes = int(comp[4:6])
         mes += 1
         if mes > 12:
             mes = 1
             ano += 1
-        
         nova_comp = f"{ano}{mes:02d}"
         self.input_competencia.setText(nova_comp)
         self.dados_app['competencia_atual'] = nova_comp
@@ -263,8 +276,6 @@ class CodureApp(QMainWindow):
 
     def extrair_malha_planilha(self, df_sec):
         malha = {}
-        chaves_concluidas = set()
-        
         col_status = 'STATUS OCI' if 'STATUS OCI' in df_sec.columns else 'STATUS'
         col_exames = 'EXAMES REALIZADOS (PRESTADOR)' if 'EXAMES REALIZADOS (PRESTADOR)' in df_sec.columns else 'PROCEDIMENTO'
         
@@ -274,23 +285,18 @@ class CodureApp(QMainWindow):
         for _, row in df_sec.iterrows():
             cpf = self.sanitizar_cpf(row['CPF'])
             if not cpf: continue
-            
             status_raw = str(row[col_status]).strip().upper().replace('Í', 'I').replace(' ', '_')
             exames_brutos = str(row[col_exames])
             codigos_encontrados = re.findall(r'\b\d{10}\b', exames_brutos)
             
             for cod in codigos_encontrados:
                 malha[(cpf, cod)] = status_raw
-                # FIX: Aceita CONCLUIDO ou OCI_CONCLUIDA
-                if status_raw.startswith('CONCLUID') or status_raw.startswith('OCI_CONCLUID'):
-                    chaves_concluidas.add((cpf, cod))
-                    
-        return malha, chaves_concluidas
+        return malha
 
     def executar_triagem(self):
         comp_atual = self.dados_app.get('competencia_atual', '')
         if not comp_atual:
-            QMessageBox.warning(self, "Aviso", "A competência não foi salva. Volte na Etapa 1 e clique em 'Salvar Configurações'.")
+            QMessageBox.warning(self, "Aviso", "A competência não foi salva na Etapa 1.")
             return
 
         arq_prestador = self.input_txt_bpa.text()
@@ -300,111 +306,266 @@ class CodureApp(QMainWindow):
             QMessageBox.warning(self, "Aviso", "Selecione o TXT do Prestador e a Planilha da Secretaria.")
             return
 
-        self.console_triagem.append("Iniciando triagem em memória...")
+        self.console_triagem.append("Iniciando triagem em memória e agrupando CPFs...")
         QApplication.processEvents()
 
         try:
-            tabela_precos = self.carregar_tabela_sigtap()
+            self.tabela_precos = self.carregar_tabela_sigtap()
             df_sec = pd.read_excel(arq_sec)
-            
-            self.console_triagem.append("Mapeando exames via Regex na Malha OCI...")
-            malha_oci, _ = self.extrair_malha_planilha(df_sec)
+            malha_oci = self.extrair_malha_planilha(df_sec)
 
+            base_dict = lambda: {'Total': {'Qtd': 0, 'Valor': 0.0}, 'RX': {'Qtd': 0, 'Valor': 0.0}, 'DENSO': {'Qtd': 0, 'Valor': 0.0}}
             self.dados_app['historicos'][comp_atual] = {
-                'Apresentado': {'Qtd': 0, 'Valor': 0.0},
-                'Liberado': {'Qtd': 0, 'Valor': 0.0},
-                'Retido': {'Qtd': 0, 'Valor': 0.0},
-                'Baixado': {'Qtd': 0, 'Valor': 0.0},
+                'Apresentado': base_dict(),
+                'Liberado': base_dict(),
+                'Retido': base_dict(),
+                'Baixado': base_dict(),
                 'arquivo_origem': os.path.basename(arq_prestador)
             }
-            resumo = self.dados_app['historicos'][comp_atual]
 
-            self.dados_bpa_limpo = []
-            self.dados_excluidos = []
-            self.dados_conferencia = []
+            self.buffer_pacientes = {}
             self.cabecalho_bpa = []
-            registros_quarentena = []
-
+            
             with open(arq_prestador, 'r', encoding='latin-1') as txt_in:
                 for linha in txt_in:
                     if linha.startswith("01"):
-                        nova_linha = linha[:7] + comp_atual + linha[13:]
-                        self.cabecalho_bpa.append(nova_linha)
+                        self.cabecalho_bpa.append(linha[:7] + comp_atual + linha[13:])
                         continue
                     elif linha.startswith("02"):
                         self.cabecalho_bpa.append(linha)
                         continue
-                    
-                    if linha.startswith("03"):
-                        comp_realizacao = linha[9:15].strip()
-                        procedimento = linha[49:59].strip()
-                        qtd_str = linha[88:94].strip()
-                        quantidade = int(qtd_str) if qtd_str.isdigit() else 1
+                    elif linha.startswith("03"):
                         cpf = linha[338:349].strip()
-                        nome = linha[112:142].strip()
+                        comp_realizacao = linha[9:15].strip()
+                        data_raw = linha[36:44].strip()
                         
-                        valor = tabela_precos.get(procedimento, 0.0)
-                        resumo['Apresentado']['Qtd'] += 1
-                        resumo['Apresentado']['Valor'] += valor
+                        if len(data_raw) == 8 and data_raw.isdigit():
+                            data_sort = f"{data_raw[4:8]}{data_raw[2:4]}{data_raw[0:2]}"
+                            data_fmt = f"{data_raw[6:8]}/{data_raw[4:6]}/{data_raw[0:4]}"
+                        else:
+                            data_sort = comp_realizacao + "00"
+                            data_fmt = comp_realizacao
+                            
+                        registro = {
+                            'linha_raw': linha,
+                            'cpf': cpf,
+                            'proc': linha[49:59].strip(),
+                            'nome': linha[112:142].strip(),
+                            'comp_realizacao': comp_realizacao,
+                            'data_sort': data_sort,
+                            'data_fmt': data_fmt,
+                            'valor': self.tabela_precos.get(linha[49:59].strip(), 0.0)
+                        }
                         
-                        chave = (cpf, procedimento)
-                        status_final_registro = "BPA-I"
-                        
+                        if cpf not in self.buffer_pacientes:
+                            self.buffer_pacientes[cpf] = []
+                        self.buffer_pacientes[cpf].append(registro)
+
+            self.conflitos_pendentes = {}
+            self.linhas_processadas = []
+            self.status_conflitos = {}
+
+            for cpf, registros in self.buffer_pacientes.items():
+                candidatos_oci = []
+                for reg in registros:
+                    chave = (cpf, reg['proc'])
+                    if reg['proc'] == CODIGO_DENSITOMETRIA:
+                        reg['status_malha'] = 'BPA-I'
+                    else:
                         if chave in malha_oci:
                             status_malha = malha_oci[chave]
-                            status_final_registro = status_malha
-                            
-                            self.dados_excluidos.append({
-                                'Competencia_Realizacao': comp_realizacao,
-                                'CPF': cpf, 'Nome': nome, 'Procedimento': procedimento,
-                                'Valor': valor, 'Status_Origem': status_malha
-                            })
-
-                            # FIX: Match flexivel
-                            if status_malha.startswith('POSSIVEL'):
-                                resumo['Retido']['Qtd'] += 1
-                                resumo['Retido']['Valor'] += valor
-                                registros_quarentena.append({
-                                    'CPF': cpf, 'Procedimento': procedimento,
-                                    'Competencia_Origem': comp_realizacao,
-                                    'Competencia_Limite': self.calcular_competencia_limite(comp_realizacao),
-                                    'Status': 'AGUARDANDO_OCI', 'Linha_Raw': linha.strip('\n')
-                                })
-                            elif status_malha.startswith('CONCLUID') or status_malha.startswith('OCI_CONCLUID'):
-                                resumo['Baixado']['Qtd'] += 1
-                                resumo['Baixado']['Valor'] += valor
+                            reg['status_malha'] = status_malha
+                            if status_malha.startswith('CONCLUID') or status_malha.startswith('OCI_CONCLUID'):
+                                candidatos_oci.append(reg)
                         else:
-                            resumo['Liberado']['Qtd'] += 1
-                            resumo['Liberado']['Valor'] += valor
-                            self.dados_bpa_limpo.append(linha)
+                            reg['status_malha'] = 'BPA-I'
                         
-                        self.dados_conferencia.append({
-                            'Competencia_Realizacao': comp_realizacao,
-                            'CPF': cpf, 'Nome': nome, 'Procedimento': procedimento,
-                            'Quantidade': quantidade, 'Status': status_final_registro
-                        })
-
-            if registros_quarentena:
-                df_novos = pd.DataFrame(registros_quarentena)
-                if not os.path.exists(ARQUIVO_HISTORICO):
-                    df_novos.to_csv(ARQUIVO_HISTORICO, index=False, sep=';', encoding='utf-8')
+                if len(candidatos_oci) > 1:
+                    self.conflitos_pendentes[cpf] = registros
+                    self.status_conflitos[cpf] = 'pendente'
                 else:
-                    df_novos.to_csv(ARQUIVO_HISTORICO, mode='a', index=False, header=False, sep=';', encoding='utf-8')
-                self.carregar_historico_tabela()
+                    self.linhas_processadas.extend(registros)
 
-            self.salvar_dados_app()
-            self.atualizar_combo_competencias()
-            
-            self.btn_export_bpa.setEnabled(True)
-            self.btn_export_excluidos.setEnabled(True)
-            self.btn_export_conf.setEnabled(True)
-
-            self.console_triagem.append("Triagem finalizada em memória! Arquivo histórico (CSV) foi atualizado.\n-> Utilize os botões abaixo para gerar os relatórios na pasta EXPORT.")
-            QMessageBox.information(self, "Triagem Finalizada", "Processamento em memória concluído! Você já pode gerar os arquivos.")
+            if self.conflitos_pendentes:
+                self.popular_lista_conflitos()
+                self.btn_finalizar_triagem.setEnabled(False)
+                QMessageBox.warning(self, "Conflitos de OCI", f"Atenção: {len(self.conflitos_pendentes)} paciente(s) possuem mais de um exame marcado como OCI Concluída.\n\nA regra determina que apenas 1 vire OCI. Redirecionando para a Etapa 3 para resolução manual.")
+                self.paginas.setCurrentIndex(2)
+            else:
+                self.finalizar_triagem_geral()
 
         except Exception as e:
             self.console_triagem.append(f"ERRO: {str(e)}")
             QMessageBox.critical(self, "Erro", f"Erro no processamento: {str(e)}")
+
+    def popular_lista_conflitos(self):
+        self.lista_cpfs.clear()
+        for cpf, registros in self.conflitos_pendentes.items():
+            nome = registros[0]['nome']
+            item = QListWidgetItem(f"{cpf} - {nome}")
+            
+            if self.status_conflitos[cpf] == 'pendente':
+                item.setBackground(QColor('#FFEB3B')) 
+                item.setForeground(QColor('#000000'))
+            else:
+                item.setBackground(QColor('#4CAF50')) 
+                item.setForeground(QColor('#FFFFFF'))
+                
+            self.lista_cpfs.addItem(item)
+            
+    def carregar_conflito_selecionado(self, item):
+        cpf = item.text().split(' - ')[0]
+        registros = self.conflitos_pendentes[cpf]
+        
+        candidatos = [r for r in registros if r['status_malha'].startswith('CONCLUID') or r['status_malha'].startswith('OCI_CONCLUID') or r.get('decisao')]
+        
+        self.tabela_conflitos.setRowCount(len(candidatos))
+        for i, cand in enumerate(candidatos):
+            self.tabela_conflitos.setItem(i, 0, QTableWidgetItem(cand['proc']))
+            self.tabela_conflitos.setItem(i, 1, QTableWidgetItem(cand['data_fmt']))
+            self.tabela_conflitos.setItem(i, 2, QTableWidgetItem(self.formatar_moeda(cand['valor'])))
+            
+            combo = QComboBox()
+            combo.addItems(["", "OCI_CONCLUIDA", "BPA-I"])
+            if cand.get('decisao'):
+                combo.setCurrentText(cand['decisao'])
+            self.tabela_conflitos.setCellWidget(i, 3, combo)
+            
+    def salvar_decisao_paciente(self):
+        item = self.lista_cpfs.currentItem()
+        if not item: return
+        cpf = item.text().split(' - ')[0]
+        
+        registros = self.conflitos_pendentes[cpf]
+        candidatos = [r for r in registros if r['status_malha'].startswith('CONCLUID') or r['status_malha'].startswith('OCI_CONCLUID') or r.get('decisao')]
+        
+        decisoes = []
+        for i in range(len(candidatos)):
+            combo = self.tabela_conflitos.cellWidget(i, 3)
+            decisao = combo.currentText()
+            decisoes.append(decisao)
+            
+        if "" in decisoes:
+            QMessageBox.warning(self, "Aviso", "Preencha a decisão para todos os procedimentos da lista antes de salvar.")
+            return
+            
+        if decisoes.count("OCI_CONCLUIDA") != 1:
+            QMessageBox.warning(self, "Aviso", "Deve haver exatamente UMA decisão 'OCI_CONCLUIDA' salva por paciente.\nOs demais deverão ser 'BPA-I'.")
+            return
+            
+        for i, cand in enumerate(candidatos):
+            cand['decisao'] = decisoes[i]
+            cand['status_malha'] = decisoes[i] 
+            
+        self.status_conflitos[cpf] = 'resolvido'
+        
+        item.setBackground(QColor('#4CAF50'))
+        item.setForeground(QColor('#FFFFFF'))
+        
+        if all(s == 'resolvido' for s in self.status_conflitos.values()):
+            self.btn_finalizar_triagem.setEnabled(True)
+            QMessageBox.information(self, "Quase Lá", "Todas as decisões foram tomadas! Clique no botão de FINALIZAR TRIAGEM logo abaixo da lista.")
+            
+    def concluir_resolucao_conflitos(self):
+        for cpf, registros in self.conflitos_pendentes.items():
+            self.linhas_processadas.extend(registros)
+        self.conflitos_pendentes.clear()
+        self.status_conflitos.clear()
+        self.finalizar_triagem_geral()
+
+    def finalizar_triagem_geral(self):
+        comp_atual = self.dados_app.get('competencia_atual', '')
+        self.dados_bpa_limpo = []
+        self.dados_excluidos = []
+        self.dados_conferencia_rx = []
+        self.dados_conferencia_denso = []
+        self.registros_quarentena = []
+        
+        resumo = self.dados_app['historicos'][comp_atual]
+
+        for reg in self.linhas_processadas:
+            tipo = 'DENSO' if reg['proc'] == CODIGO_DENSITOMETRIA else 'RX'
+            valor = reg['valor']
+            
+            # Normalização de Nomenclatura para evitar o problema de "CONCLUIDO" no relatorio
+            status_original = reg['status_malha']
+            if status_original.startswith('POSSIVEL'):
+                status_padrao = 'POSSIVEL_OCI'
+            elif status_original.startswith('CONCLUID') or status_original.startswith('OCI_CONCLUID'):
+                status_padrao = 'OCI_CONCLUIDA'
+            else:
+                status_padrao = status_original
+            
+            resumo['Apresentado']['Total']['Qtd'] += 1
+            resumo['Apresentado']['Total']['Valor'] += valor
+            resumo['Apresentado'][tipo]['Qtd'] += 1
+            resumo['Apresentado'][tipo]['Valor'] += valor
+            
+            cat_destino = None
+            
+            if status_padrao == 'POSSIVEL_OCI':
+                cat_destino = 'Retido'
+                self.dados_excluidos.append({
+                    'Competencia_Realizacao': reg['comp_realizacao'],
+                    'CPF': reg['cpf'], 'Nome': reg['nome'], 'Procedimento': reg['proc'],
+                    'Valor': valor, 'Status_Origem': status_padrao
+                })
+                self.registros_quarentena.append({
+                    'CPF': reg['cpf'], 'Procedimento': reg['proc'],
+                    'Competencia_Origem': reg['comp_realizacao'],
+                    'Competencia_Limite': self.calcular_competencia_limite(reg['comp_realizacao']),
+                    'Status': 'AGUARDANDO_OCI', 'Linha_Raw': reg['linha_raw'].strip('\n')
+                })
+            elif status_padrao == 'OCI_CONCLUIDA':
+                cat_destino = 'Baixado'
+                self.dados_excluidos.append({
+                    'Competencia_Realizacao': reg['comp_realizacao'],
+                    'CPF': reg['cpf'], 'Nome': reg['nome'], 'Procedimento': reg['proc'],
+                    'Valor': valor, 'Status_Origem': status_padrao
+                })
+            else:
+                cat_destino = 'Liberado'
+                self.dados_bpa_limpo.append(reg['linha_raw'])
+                
+            resumo[cat_destino]['Total']['Qtd'] += 1
+            resumo[cat_destino]['Total']['Valor'] += valor
+            resumo[cat_destino][tipo]['Qtd'] += 1
+            resumo[cat_destino][tipo]['Valor'] += valor
+                
+            if tipo == 'DENSO':
+                self.dados_conferencia_denso.append({
+                    'CPF': reg['cpf'],
+                    'Nome': reg['nome'],
+                    'Procedimento': reg['proc']
+                })
+            else:
+                self.dados_conferencia_rx.append({
+                    'Data_Sort': reg['data_sort'],
+                    'Data_Atendimento': reg['data_fmt'],
+                    'CPF': reg['cpf'],
+                    'Nome': reg['nome'],
+                    'Procedimento': reg['proc'],
+                    'Status': status_padrao
+                })
+
+        if self.registros_quarentena:
+            df_novos = pd.DataFrame(self.registros_quarentena)
+            if not os.path.exists(ARQUIVO_HISTORICO):
+                df_novos.to_csv(ARQUIVO_HISTORICO, index=False, sep=';', encoding='utf-8')
+            else:
+                df_novos.to_csv(ARQUIVO_HISTORICO, mode='a', index=False, header=False, sep=';', encoding='utf-8')
+            self.carregar_historico_tabela()
+
+        self.salvar_dados_app()
+        self.atualizar_combo_competencias()
+        
+        self.btn_export_bpa.setEnabled(True)
+        self.btn_export_excluidos.setEnabled(True)
+        self.btn_export_conf.setEnabled(True)
+
+        self.paginas.setCurrentIndex(1)
+        self.console_triagem.append("Triagem FINALIZADA com sucesso! Arquivo histórico (CSV) foi atualizado.\n-> Utilize os botões abaixo para gerar os relatórios na pasta EXPORT.")
+        QMessageBox.information(self, "Triagem Finalizada", "Processamento completo! Você já pode gerar os arquivos de exportação.")
 
     def gerar_bpa_limpo(self):
         comp_atual = self.dados_app.get('competencia_atual', '')
@@ -423,14 +584,34 @@ class CodureApp(QMainWindow):
         arq_saida = os.path.join(DIR_EXPORT, f"RELATORIO_EXCLUIDOS_{comp_atual}.csv")
         pd.DataFrame(self.dados_excluidos).to_csv(arq_saida, index=False, sep=';', encoding='utf-8-sig')
         self.console_triagem.append(f"[GERADO] -> {os.path.basename(arq_saida)}")
-        QMessageBox.information(self, "Sucesso", f"Relatório de Excluídos salvo na pasta EXPORT:\n{os.path.basename(arq_saida)}")
+        QMessageBox.information(self, "Sucesso", f"Relatório de Excluídos salvo:\n{os.path.basename(arq_saida)}")
 
     def gerar_relatorio_conferencia(self):
         comp_atual = self.dados_app.get('competencia_atual', '')
-        arq_saida = os.path.join(DIR_EXPORT, f"CONFERENCIA_MANUAL_{comp_atual}.csv")
-        pd.DataFrame(self.dados_conferencia).to_csv(arq_saida, index=False, sep=';', encoding='utf-8-sig')
-        self.console_triagem.append(f"[GERADO] -> {os.path.basename(arq_saida)}")
-        QMessageBox.information(self, "Sucesso", f"Relatório de Conferência salvo na pasta EXPORT:\n{os.path.basename(arq_saida)}")
+        gerados = []
+        
+        df_rx = pd.DataFrame(self.dados_conferencia_rx)
+        if not df_rx.empty:
+            df_rx = df_rx.sort_values(by=['Data_Sort', 'Nome'])
+            df_rx = df_rx[['Data_Atendimento', 'CPF', 'Nome', 'Procedimento', 'Status']]
+            arq_rx = os.path.join(DIR_EXPORT, f"CONFERENCIA_RX_{comp_atual}.xlsx")
+            df_rx.to_excel(arq_rx, index=False)
+            gerados.append(os.path.basename(arq_rx))
+            
+        df_denso = pd.DataFrame(self.dados_conferencia_denso)
+        if not df_denso.empty:
+            df_denso = df_denso.sort_values(by=['Nome'])
+            df_denso = df_denso[['CPF', 'Nome', 'Procedimento']]
+            arq_denso = os.path.join(DIR_EXPORT, f"CONFERENCIA_DENSITOMETRIA_{comp_atual}.xlsx")
+            df_denso.to_excel(arq_denso, index=False)
+            gerados.append(os.path.basename(arq_denso))
+            
+        if gerados:
+            msg = "\n".join(gerados)
+            self.console_triagem.append(f"[GERADOS] -> \n{msg}")
+            QMessageBox.information(self, "Sucesso", f"Planilhas de Conferência (XLSX) salvos na pasta EXPORT:\n\n{msg}")
+        else:
+            QMessageBox.information(self, "Aviso", "Nenhum dado de conferência para gerar.")
 
     def carregar_historico_tabela(self):
         if os.path.exists(ARQUIVO_HISTORICO):
@@ -468,17 +649,18 @@ class CodureApp(QMainWindow):
         if not arq_sec_extra:
             QMessageBox.warning(self, "Aviso", "Selecione a Planilha de Atualização OCI.")
             return
-            
         if not os.path.exists(ARQUIVO_HISTORICO):
             QMessageBox.information(self, "Aviso", "Não há registros retidos no histórico para atualizar.")
             return
             
         try:
             df_sec = pd.read_excel(arq_sec_extra)
-            _, chaves_concluidas = self.extrair_malha_planilha(df_sec)
+            malha = self.extrair_malha_planilha(df_sec)
+            
+            chaves_concluidas = {k for k, v in malha.items() if v.startswith('CONCLUID') or v.startswith('OCI_CONCLUID')}
             
             if not chaves_concluidas:
-                QMessageBox.information(self, "Aviso", "A planilha não possui registros de OCI_CONCLUIDA válidos.")
+                QMessageBox.information(self, "Aviso", "A planilha não possui registros de OCI Concluída válidos.")
                 return
 
             df_hist = pd.read_csv(ARQUIVO_HISTORICO, sep=';', dtype=str)
@@ -506,7 +688,7 @@ class CodureApp(QMainWindow):
         arq_prestador = self.input_txt_bpa.text()
 
         if not comp_atual or not arq_prestador:
-            QMessageBox.warning(self, "Aviso", "O 'BPA Bruto' e a Competência Atual precisam estar preenchidos (Etapas 1 e 2) para base do cabeçalho.")
+            QMessageBox.warning(self, "Aviso", "O 'BPA Bruto' e a Competência Atual precisam estar preenchidos para base do cabeçalho.")
             return
             
         if not os.path.exists(ARQUIVO_HISTORICO):
@@ -530,8 +712,7 @@ class CodureApp(QMainWindow):
             with open(arq_prestador, 'r', encoding='latin-1') as txt_in:
                 for linha in txt_in:
                     if linha.startswith("01"):
-                        nova_linha = linha[:7] + comp_atual + linha[13:]
-                        cabecalho.append(nova_linha)
+                        cabecalho.append(linha[:7] + comp_atual + linha[13:])
                     elif linha.startswith("02"):
                         cabecalho.append(linha)
                     else:
@@ -543,7 +724,6 @@ class CodureApp(QMainWindow):
                 for index, row in df_vencidos.iterrows():
                     txt_out.write(str(row['Linha_Raw']) + '\n')
                     df_hist.at[index, 'Status'] = 'BPA_REPESCADO'
-                    
                     procedimento = self.sanitizar_codigo(row['Procedimento'], 10)
                     valor_total_repescado += tabela_precos.get(procedimento, 0.0)
                     qtd_repescado += 1
@@ -552,8 +732,7 @@ class CodureApp(QMainWindow):
             self.carregar_historico_tabela()
             
             val_format = self.formatar_moeda(valor_total_repescado)
-            mensagem = f"Repescagem concluída na pasta EXPORT!\n\nFísico: {qtd_repescado} procedimentos\nFinanceiro: R$ {val_format}"
-            QMessageBox.information(self, "Sucesso", mensagem)
+            QMessageBox.information(self, "Sucesso", f"Repescagem concluída!\n\nFísico: {qtd_repescado} procedimentos\nFinanceiro: R$ {val_format}")
 
         except Exception as e:
             QMessageBox.critical(self, "Erro", f"Erro na repescagem: {str(e)}")
@@ -577,24 +756,38 @@ class CodureApp(QMainWindow):
         conteudo += "="*65 + "\n\n"
         
         for k in ['Apresentado', 'Retido', 'Baixado', 'Liberado']:
-            v = dados[k]
+            t = dados[k]['Total']
+            r = dados[k]['RX']
+            d = dados[k]['DENSO']
+            
             label = k.ljust(15)
-            qtd = str(v['Qtd']).zfill(4)
-            valor = self.formatar_moeda(v['Valor']).rjust(12)
-            conteudo += f"| {label} | Físico: {qtd} un. | Financeiro: R$ {valor} |\n"
+            qtd_tot = str(t['Qtd']).zfill(4)
+            val_tot = self.formatar_moeda(t['Valor']).rjust(12)
+            conteudo += f"| {label} | TOTAL Físico: {qtd_tot} un. | Financeiro: R$ {val_tot} |\n"
+            
+            qtd_rx = str(r['Qtd']).zfill(4)
+            val_rx = self.formatar_moeda(r['Valor']).rjust(12)
+            
+            show_denso = (k in ['Apresentado', 'Liberado'])
+            if show_denso:
+                qtd_denso = str(d['Qtd']).zfill(4)
+                val_denso = self.formatar_moeda(d['Valor']).rjust(12)
+                conteudo += f"|                 |  ├─ RX: {qtd_rx} un.       | Financeiro: R$ {val_rx.rjust(12)} |\n"
+                conteudo += f"|                 |  └─ DENSO: {qtd_denso} un.    | Financeiro: R$ {val_denso.rjust(12)} |\n"
+            else:
+                conteudo += f"|                 |  └─ RX: {qtd_rx} un.       | Financeiro: R$ {val_rx.rjust(12)} |\n"
                 
-        conteudo += "\n" + "="*65 + "\n"
-        
+            conteudo += "-"*65 + "\n"
+                
         with open(nome_extrato, "w", encoding="utf-8") as f:
             f.write(conteudo)
             
-        QMessageBox.information(self, "Sucesso", f"Extrato da competência {comp} salvo na pasta EXPORT:\n{os.path.basename(nome_extrato)}")
+        QMessageBox.information(self, "Sucesso", f"Extrato salvo:\n{os.path.basename(nome_extrato)}")
 
     def criar_pagina_configuracao(self):
         page = QWidget()
         layout = QVBoxLayout(page)
         layout.setContentsMargins(40, 40, 40, 40)
-        
         layout.addWidget(QLabel("<h2>Etapa 1: Parâmetros Globais</h2>"))
         layout.addSpacing(20)
         
@@ -602,10 +795,8 @@ class CodureApp(QMainWindow):
         lbl_comp = QLabel("Competência Atual de Submissão (AAAAMM):")
         lbl_comp.setFixedWidth(280)
         h_comp.addWidget(lbl_comp)
-        
         self.input_competencia = QLineEdit()
         self.input_competencia.setText(self.dados_app.get('competencia_atual', ''))
-        self.input_competencia.setPlaceholderText("Ex: 202610")
         self.input_competencia.setFixedWidth(150)
         h_comp.addWidget(self.input_competencia)
         h_comp.addStretch()
@@ -613,14 +804,12 @@ class CodureApp(QMainWindow):
         
         layout.addSpacing(10)
         self.input_sigtap = self.criar_linha_arquivo(layout, "Tabela de Valores (SIGTAP Ex-DBF):", DIR_GLOBAL)
-        
         layout.addSpacing(20)
         btn_salvar = QPushButton("SALVAR CONFIGURAÇÕES")
         btn_salvar.setObjectName("btn_action")
         btn_salvar.setFixedWidth(250)
         btn_salvar.clicked.connect(self.salvar_config_global)
         layout.addWidget(btn_salvar)
-        
         layout.addStretch()
         return page
 
@@ -628,7 +817,6 @@ class CodureApp(QMainWindow):
         page = QWidget()
         layout = QVBoxLayout(page)
         layout.setContentsMargins(40, 40, 40, 40)
-        
         layout.addWidget(QLabel("<h2>Etapa 2: Triagem e Geração de Arquivos</h2>"))
         layout.addWidget(QLabel("Triagem em memória e geração modular de relatórios (Salvos na pasta EXPORT)"))
         layout.addSpacing(10)
@@ -637,8 +825,7 @@ class CodureApp(QMainWindow):
         self.input_planilha_sec_mes = self.criar_linha_arquivo(layout, "Malha OCI da Secretaria (Excel):", DIR_IMPORT)
         
         h_botoes = QHBoxLayout()
-        
-        self.btn_rodar_triagem = QPushButton("1. EXECUTAR TRIAGEM (Memória)")
+        self.btn_rodar_triagem = QPushButton("1. EXECUTAR TRIAGEM")
         self.btn_rodar_triagem.setObjectName("btn_action")
         self.btn_rodar_triagem.clicked.connect(self.executar_triagem)
         h_botoes.addWidget(self.btn_rodar_triagem)
@@ -662,28 +849,68 @@ class CodureApp(QMainWindow):
         h_botoes.addWidget(self.btn_export_conf)
         
         layout.addLayout(h_botoes)
-        
         layout.addWidget(QLabel("Console de Processamento:"))
         self.console_triagem = QTextEdit()
         self.console_triagem.setReadOnly(True)
         layout.addWidget(self.console_triagem)
         return page
 
-    def criar_pagina_gestao(self):
+    def criar_pagina_resolucao(self):
         page = QWidget()
         layout = QVBoxLayout(page)
         layout.setContentsMargins(40, 40, 40, 40)
         
+        layout.addWidget(QLabel("<h2>Etapa 3: Resolução de Conflitos OCI</h2>"))
+        layout.addWidget(QLabel("Pacientes com múltiplos exames identificados como 'OCI Concluída' na malha.\nPara CADA paciente, escolha EXATAMENTE UMA linha para ser a OCI, e as demais devem ser BPA-I."))
+        layout.addSpacing(10)
+        
+        h_split = QHBoxLayout()
+        
+        v_lista = QVBoxLayout()
+        v_lista.addWidget(QLabel("Pacientes Pendentes (Amarelo = Pendente | Verde = Salvo):"))
+        self.lista_cpfs = QListWidget()
+        self.lista_cpfs.setFixedWidth(300)
+        self.lista_cpfs.itemClicked.connect(self.carregar_conflito_selecionado)
+        v_lista.addWidget(self.lista_cpfs)
+        
+        self.btn_finalizar_triagem = QPushButton("FINALIZAR TRIAGEM E GERAR RESULTADOS")
+        self.btn_finalizar_triagem.setObjectName("btn_action")
+        self.btn_finalizar_triagem.setEnabled(False)
+        self.btn_finalizar_triagem.clicked.connect(self.concluir_resolucao_conflitos)
+        v_lista.addWidget(self.btn_finalizar_triagem)
+        
+        h_split.addLayout(v_lista)
+        
+        v_tabela = QVBoxLayout()
+        v_tabela.addWidget(QLabel("Defina o destino (Decisão) para CADA um dos exames abaixo e Salve:"))
+        self.tabela_conflitos = QTableWidget(0, 4)
+        self.tabela_conflitos.setHorizontalHeaderLabels(["Procedimento", "Data", "Valor", "Decisão Final"])
+        self.tabela_conflitos.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        v_tabela.addWidget(self.tabela_conflitos)
+        
+        btn_resolver = QPushButton("SALVAR DECISÃO DESTE PACIENTE")
+        btn_resolver.setObjectName("btn_warning")
+        btn_resolver.clicked.connect(self.salvar_decisao_paciente)
+        v_tabela.addWidget(btn_resolver)
+        
+        h_split.addLayout(v_tabela)
+        layout.addLayout(h_split)
+        return page
+
+    def criar_pagina_gestao(self):
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(40, 40, 40, 40)
         h_title = QHBoxLayout()
-        h_title.addWidget(QLabel("<h2>Etapa 3: Gestão de Banco de Dados e Atrasados</h2>"))
-        btn_atualizar = QPushButton("Atualizar Tabela CSV (Pós-Edição Manual)")
-        btn_atualizar.setFixedWidth(280)
+        h_title.addWidget(QLabel("<h2>Etapa 4: Gestão de Banco de Dados e Atrasados</h2>"))
+        btn_atualizar = QPushButton("Atualizar Tabela CSV")
+        btn_atualizar.setFixedWidth(200)
         btn_atualizar.clicked.connect(self.carregar_historico_tabela)
         h_title.addWidget(btn_atualizar)
         layout.addLayout(h_title)
         
-        layout.addWidget(QLabel("A) Atualização Manual de OCI (Caso a secretaria mande planilhas de OCIs concluídas em lote)"))
-        self.input_planilha_sec_extra = self.criar_linha_arquivo(layout, "Planilha Avulsa OCI (Excel):", DIR_IMPORT)
+        layout.addWidget(QLabel("A) Atualização Manual OCI (Lote avulso)"))
+        self.input_planilha_sec_extra = self.criar_linha_arquivo(layout, "Planilha Avulsa (Excel):", DIR_IMPORT)
         btn_atualizar_oci = QPushButton("Atualizar Status (Malha Avulsa)")
         btn_atualizar_oci.setObjectName("btn_action")
         btn_atualizar_oci.setFixedWidth(280)
@@ -691,10 +918,9 @@ class CodureApp(QMainWindow):
         layout.addWidget(btn_atualizar_oci)
         
         layout.addSpacing(20)
-        layout.addWidget(QLabel("B) Histórico de Procedimentos Retidos no CSV:"))
-        
+        layout.addWidget(QLabel("B) Histórico (AGUARDANDO_OCI)"))
         self.input_filtro = QLineEdit()
-        self.input_filtro.setPlaceholderText("🔎 Filtrar tabela por CPF, Procedimento, Competência ou Status (Ex: AGUARDANDO_OCI)...")
+        self.input_filtro.setPlaceholderText("🔎 Filtrar tabela...")
         self.input_filtro.textChanged.connect(self.filtrar_tabela_historico)
         layout.addWidget(self.input_filtro)
         
@@ -707,7 +933,6 @@ class CodureApp(QMainWindow):
         self.btn_gerar_repescagem.setObjectName("btn_warning")
         self.btn_gerar_repescagem.clicked.connect(self.executar_repescagem)
         layout.addWidget(self.btn_gerar_repescagem)
-        
         return page
 
     def criar_pagina_resumo(self):
@@ -716,9 +941,9 @@ class CodureApp(QMainWindow):
         layout.setContentsMargins(40, 40, 40, 40)
         
         h_filtro = QHBoxLayout()
-        h_filtro.addWidget(QLabel("<h2>Etapa 4: Extrato Físico-Financeiro</h2>"))
+        h_filtro.addWidget(QLabel("<h2>Etapa 5: Extrato Físico-Financeiro</h2>"))
         h_filtro.addStretch()
-        h_filtro.addWidget(QLabel("Visualizar Competência:"))
+        h_filtro.addWidget(QLabel("Competência:"))
         
         self.combo_comp = QComboBox()
         self.combo_comp.setFixedWidth(120)
@@ -726,32 +951,29 @@ class CodureApp(QMainWindow):
         h_filtro.addWidget(self.combo_comp)
         layout.addLayout(h_filtro)
         
-        self.lbl_apresentado = QLabel("")
-        self.lbl_retido = QLabel("")
-        self.lbl_baixado = QLabel("")
-        self.lbl_liberado = QLabel("")
+        self.lbl_apresentado = QLabel()
+        self.lbl_retido = QLabel()
+        self.lbl_baixado = QLabel()
+        self.lbl_liberado = QLabel()
         
         for lbl in [self.lbl_apresentado, self.lbl_retido, self.lbl_baixado, self.lbl_liberado]:
-            lbl.setStyleSheet("font-size: 16px; padding: 15px; background-color: #2C2C2C; border-radius: 4px; margin-bottom: 10px; font-family: monospace;")
+            lbl.setStyleSheet("font-size: 15px; padding: 15px; background-color: #2C2C2C; border-radius: 4px; margin-bottom: 5px; font-family: monospace;")
             layout.addWidget(lbl)
             
         layout.addSpacing(20)
         
         h_botoes = QHBoxLayout()
-        h_botoes.setSpacing(20) # Add some space between buttons
+        h_botoes.setSpacing(20)
         
         btn_baixar = QPushButton("DOWNLOAD DO EXTRATO (TXT)")
-        btn_baixar.setObjectName("btn_action")
-        # Ajuste de tamanho forçado via estilo (igualando visualmente na proporcao 50/50 com o da direita)
         btn_baixar.setStyleSheet("QPushButton { background-color: #2196F3; font-size: 14px; padding: 15px; } QPushButton:hover { background-color: #1976D2; }")
         btn_baixar.clicked.connect(self.baixar_extrato_txt)
-        h_botoes.addWidget(btn_baixar, 1) # weight 1
+        h_botoes.addWidget(btn_baixar, 1)
         
-        btn_proxima = QPushButton("AVANÇAR PARA A PRÓXIMA COMPETÊNCIA (MÊS SEGUINTE)")
-        btn_proxima.setObjectName("btn_warning")
+        btn_proxima = QPushButton("AVANÇAR COMPETÊNCIA")
         btn_proxima.setStyleSheet("QPushButton { background-color: #FF9800; font-size: 14px; padding: 15px; } QPushButton:hover { background-color: #F57C00; }")
         btn_proxima.clicked.connect(self.avancar_competencia)
-        h_botoes.addWidget(btn_proxima, 1) # weight 1
+        h_botoes.addWidget(btn_proxima, 1)
         
         layout.addLayout(h_botoes)
         layout.addStretch()
@@ -779,7 +1001,7 @@ class CodureApp(QMainWindow):
 if __name__ == "__main__":
     import ctypes
     try:
-        myappid = 'franca.saude.codure.v10' 
+        myappid = 'franca.saude.codure.v13' 
         ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(myappid)
     except Exception:
         pass
